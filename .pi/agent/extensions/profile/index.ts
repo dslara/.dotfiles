@@ -1,14 +1,15 @@
 /**
- * Profile Extension (issue 08: scaffold + config + seleção).
+ * Profile Extension (issues 08+09+10).
  *
  * Profiles nomeados em `settings.json` (global + projeto), camada opt-in:
  * sem profile ativo = Pi como hoje. Lê `profiles:{}` mesclado (global→projeto,
- * perfil atômico), resolve `extends` pós-merge e seleciona o profile
- * (`--profile` > escolha da sessão > default de projeto (trusted) > global).
- *
- * Escopo 08: seleção + marcador (footer `setStatus` + `profile-state`).
- * Enforcement das allowlists (tools/skills/prompts/extensions) é issue 09 —
- * ver o ponto `applyEnforcement` abaixo.
+ * perfil atômico), resolve `extends` pós-merge, seleciona o profile
+ * (`--profile` > escolha da sessão > default de projeto (trusted) > global)
+ * e aplica as allowlists (tools via `setActiveTools` + backstop `tool_call`;
+ * skills/prompts via `input` + filtro no system prompt; gate de extensões).
+ * Troca = reload in-place com marcador triplo (footer + `profile-state` +
+ * carimbo `profile-mark`). Detalhes em README.md; problemas em
+ * TROUBLESHOOTING.md.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -16,6 +17,8 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { Box, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
 import {
   activationError,
   emptyProfileWarning,
@@ -29,6 +32,7 @@ import {
   planField,
   planTools,
   filterSkillMentions,
+  inventoryOrigin,
   resolveProfile,
   selectStartup,
   toolOwnerName,
@@ -43,13 +47,15 @@ import {
 } from "./config.js";
 
 /** Manter em sync com package.json. Exibido no seletor/list. */
-const EXT_VERSION = "0.1.0";
+const EXT_VERSION = "0.2.0";
 /** Baseline de compat testada. Mismatch = warning, nunca trava o boot. */
 const PI_COMPAT = "0.85.0";
 
 const STATUS_ID = "profile";
 const STATE_TYPE = "profile-state";
+const MARK_TYPE = "profile-mark";
 const NONE_LABEL = "(none)";
+const TOOL_NAME = "profile_use";
 
 /** Leitura + UI (eventos e comandos). Reload só onde a troca exige (use/seletor). */
 type ProfileReadCtx = Pick<ExtensionContext, "cwd" | "hasUI" | "isProjectTrusted" | "sessionManager" | "ui">;
@@ -219,6 +225,45 @@ export default function profileExtension(pi: ExtensionAPI) {
     type: "string",
   });
 
+  // Carimbo no transcript (marcador triplo, espec §5): rende `profile-mark` no TUI,
+  // persiste na sessão, fora do contexto do LLM.
+  pi.registerEntryRenderer(MARK_TYPE, (entry, _options, theme) => {
+    const data = (entry as { data?: { name?: unknown; entries?: unknown } }).data ?? {};
+    const label =
+      typeof data.name === "string" && data.name ? `Profile: ${data.name}` : "Profile desativado — Pi como hoje";
+    const n = typeof data.entries === "number" ? data.entries : "?";
+    const box = new Box(1, 1, (text: string) => theme.bg("customMessageBg", text));
+    box.addChild(new Text(`${theme.bold(label)} — reload in-place, conversa preservada (${String(n)} entradas)`));
+    return box;
+  });
+
+  // Ferramenta do LLM para trocar de profile (molde reload-runtime.ts): enfileira
+  // `/profile use` como follow-up. Obedece ao profile vigente como qualquer tool.
+  pi.registerTool({
+    name: TOOL_NAME,
+    label: "Switch profile",
+    description:
+      "Switch the active Pi profile. Use /profile list for names; \"(none)\" clears back to plain Pi. Queues /profile use as a follow-up command (in-place reload, conversation preserved).",
+    parameters: Type.Object({
+      name: Type.String({ description: "Profile name from /profile list, or (none) to clear" }),
+    }),
+    async execute(_toolCallId, params) {
+      const raw = params.name;
+      const name = typeof raw === "string" ? raw.trim().split(/\s+/)[0] : "";
+      if (!name || (name !== NONE_LABEL && !/^[A-Za-z0-9._-]+$/.test(name))) {
+        return {
+          content: [{ type: "text", text: `Invalid profile name: ${JSON.stringify(raw)}. Use /profile list for names.` }],
+          details: {},
+        };
+      }
+      pi.sendUserMessage(`/profile use ${name}`, { deliverAs: "followUp" });
+      return {
+        content: [{ type: "text", text: `Queued /profile use ${name} as a follow-up command.` }],
+        details: {},
+      };
+    },
+  });
+
   function setMarker(ctx: ProfileReadCtx, name: string | null): void {
     activeName = name;
     if (name === null) enforcement = null;
@@ -336,10 +381,13 @@ export default function profileExtension(pi: ExtensionAPI) {
       ctx.ui.notify(activationError(r.message), originNote === "--profile" ? "warning" : "error");
       return;
     }
-    if (isEmptyProfile(r.profile)) ctx.ui.notify(emptyProfileWarning(), "warning");
+    if (originNote && isEmptyProfile(r.profile)) ctx.ui.notify(emptyProfileWarning(), "warning");
     setMarker(ctx, name);
     applyEnforcement(ctx, name, r.profile);
-    if (originNote) ctx.ui.notify(`Profile "${name}" ativo (${originNote}).`, "info");
+    if (originNote) {
+      stampMark(ctx, name, originNote);
+      ctx.ui.notify(`Profile "${name}" ativo (${originNote}).`, "info");
+    }
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -449,6 +497,11 @@ export default function profileExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
+  /** Carimbo no transcript da troca/ativação (terceira perna do marcador). */
+  function stampMark(ctx: ProfileReadCtx, name: string | null, via: string): void {
+    pi.appendEntry(MARK_TYPE, { name, entries: ctx.sessionManager.getEntries().length, via });
+  }
+
   /** Persiste a escolha explícita e recarrega in-place (terminal no handler). */
   async function persistChoiceAndReload(
     ctx: ProfileCmdCtx,
@@ -459,6 +512,7 @@ export default function profileExtension(pi: ExtensionAPI) {
     setMarker(ctx, name);
     pi.appendEntry(STATE_TYPE, { name });
     const n = ctx.sessionManager.getEntries().length;
+    stampMark(ctx, name, "use");
     ctx.ui.notify(`${message} Reload in-place — conversa preservada (${n} entradas).`, level);
     await ctx.reload();
     return;
@@ -515,6 +569,7 @@ export default function profileExtension(pi: ExtensionAPI) {
     }
     const extensionsNote = undetectedExtensionsNote(r.profile, toolsInv, commands);
     if (extensionsNote !== null) lines.push(extensionsNote);
+    lines.push("Veja /profile inventory para todos os nomes disponíveis.");
     for (const w of warnings) lines.push(w);
     for (const w of loaded.warnings) lines.push(w);
     ctx.ui.notify(lines.join("\n"), "info");
@@ -573,12 +628,73 @@ export default function profileExtension(pi: ExtensionAPI) {
     }
   }
 
+  /** Inventário listing-first: origem, nome invocável real, descrição, habilitado-no-ativo. */
+  function inventoryText(
+    loaded: LoadedConfig,
+    toolsInv: ToolInventoryEntry[],
+    commands: CommandInventoryEntry[],
+    only?: string,
+  ): string | null {
+    const sections = ["tools", "skills", "prompts", "extensions"];
+    if (only !== undefined && !sections.includes(only)) return null;
+    const want = (s: string): boolean => only === undefined || only === s;
+    const lines = [`Inventário (${versionLine()}) — copie os nomes para montar o profile:`];
+    const short = (d: string | undefined): string => {
+      if (!d) return "";
+      const one = d.replace(/\s+/g, " ").trim();
+      return one.length > 90 ? `${one.slice(0, 87)}…` : one;
+    };
+    const mark = (on: boolean): string => (on ? "✓" : "—");
+    if (want("tools")) {
+      lines.push("tools:");
+      const descriptions = new Map(pi.getAllTools().map((t) => [t.name, t.description]));
+      for (const t of toolsInv) {
+        const owner = t.owner === null ? (t.builtin ? "builtin" : "sdk") : t.owner;
+        const on = enforcement !== null && enforcement.toolsTouched && enforcement.finalTools.includes(t.name);
+        const desc = short(descriptions.get(t.name));
+        lines.push(`- ${t.name} — ${desc} [${owner}]${enforcement?.toolsTouched ? ` ${mark(on)}` : ""}`);
+      }
+    }
+    if (want("skills") || want("prompts")) {
+      const byName = new Map(commands.map((c) => [c.name, c]));
+      const descs = new Map(pi.getCommands().map((c) => [c.name, c.description]));
+      for (const kind of ["skills", "prompts"] as const) {
+        if (!want(kind)) continue;
+        const singular = kind === "skills" ? "skill" : "prompt";
+        lines.push(`${kind}:`);
+        const items = commands.filter((c) => c.source === singular);
+        if (items.length === 0) lines.push("(nenhum)");
+        for (const c of items) {
+          const info = byName.get(c.name);
+          const origin = info ? inventoryOrigin(info.sourceInfo, getAgentDir()) : "?";
+          const bare = kind === "skills" ? normalizeSkillName(c.name) : c.name;
+          const allowed =
+            enforcement !== null &&
+            (kind === "skills" ? enforcement.skillsTouched : enforcement.promptsTouched) &&
+            (kind === "skills" ? enforcement.allowedSkills : enforcement.allowedPrompts).includes(bare);
+          const touched = enforcement !== null && (kind === "skills" ? enforcement.skillsTouched : enforcement.promptsTouched);
+          const desc = short(descs.get(c.name));
+          lines.push(`- ${c.name} — ${desc} [${origin}]${touched ? ` ${mark(allowed)}` : ""}`);
+        }
+      }
+    }
+    if (want("extensions")) {
+      lines.push("extensions (com tools/comandos detectados):");
+      const owners = [...new Set(commands.filter((c) => c.source === "extension").map((c) => toolOwnerName(c.sourceInfo)).filter((o): o is string => o !== null))];
+      for (const t of toolsInv) if (t.owner !== null && !owners.includes(t.owner)) owners.push(t.owner);
+      owners.sort();
+      if (owners.length === 0) lines.push("(nenhuma)");
+      for (const o of owners) lines.push(`- ${o}`);
+    }
+    return lines.join("\n");
+  }
+
   pi.registerCommand("profile", {
-    description: "Selecionar profile nomeado (list/show/use)",
+    description: "Selecionar profile nomeado (list/show/use/inventory)",
     getArgumentCompletions: (prefix: string) => {
       const space = prefix.indexOf(" ");
       if (space === -1) {
-        const out = ["list", "show", "use", ...globalNamesForCompletion()]
+        const out = ["list", "show", "use", "inventory", ...globalNamesForCompletion()]
           .filter((v) => v.startsWith(prefix))
           .map((v) => ({ value: v, label: v }));
         return out.length > 0 ? out : null;
@@ -588,6 +704,10 @@ export default function profileExtension(pi: ExtensionAPI) {
       if (first === "show" || first === "use") {
         const names = globalNamesForCompletion().filter((n) => n.startsWith(rest));
         return names.length > 0 ? names.map((v) => ({ value: `${first} ${v}`, label: v })) : null;
+      }
+      if (first === "inventory") {
+        const kinds = ["tools", "skills", "prompts", "extensions"].filter((k) => k.startsWith(rest));
+        return kinds.length > 0 ? kinds.map((v) => ({ value: `inventory ${v}`, label: v })) : null;
       }
       return null;
     },
@@ -603,6 +723,16 @@ export default function profileExtension(pi: ExtensionAPI) {
       const target = rest.join(" ");
       if (sub === "list" && !target) {
         ctx.ui.notify(listText(loaded), "info");
+        return;
+      }
+      if (sub === "inventory") {
+        const kind = target.split(/\s+/)[0] || undefined;
+        const text = inventoryText(loaded, collectTools(), collectCommands(), kind);
+        if (text === null) {
+          ctx.ui.notify("Uso: /profile inventory [tools|skills|prompts|extensions]", "error");
+          return;
+        }
+        ctx.ui.notify(text, "info");
         return;
       }
       if (sub === "show" && target) {
@@ -623,7 +753,10 @@ export default function profileExtension(pi: ExtensionAPI) {
         await useProfile(ctxp, null);
         return;
       }
-      ctx.ui.notify(`Uso: /profile · /profile list · /profile show <nome> · /profile use <nome|${NONE_LABEL}>`, "error");
+      ctx.ui.notify(
+        `Uso: /profile · /profile list · /profile show <nome> · /profile use <nome|${NONE_LABEL}> · /profile inventory [recurso]`,
+        "error",
+      );
     },
   });
 }

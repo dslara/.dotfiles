@@ -147,6 +147,30 @@ export function formatVersionLine(extVersion: string, piCompat: string): string 
   return `ext v${extVersion} · Pi ${piCompat}`;
 }
 
+export interface InventoryProvenance {
+  source: string;
+  path: string;
+  scope?: string;
+  origin?: string;
+}
+
+/**
+ * Origem legível para o inventário listing-first: projeto / global /
+ * package X / builtin / sdk / cli. Global = dentro do agentDir do usuário.
+ */
+export function inventoryOrigin(info: InventoryProvenance, agentDir: string): string {
+  if (info.scope === "project") return "projeto";
+  if (info.origin === "package") return `package ${info.source}`;
+  if (info.source === "builtin") return "builtin";
+  if (info.source === "sdk") return "sdk";
+  if (info.source === "cli") return "cli";
+  const norm = (p: string) => p.replace(/[\\/]+$/, "");
+  const dir = norm(agentDir);
+  const path = norm(info.path);
+  if (path === dir || path.startsWith(`${dir}/`) || path.startsWith(`${dir}\\`)) return "global";
+  return info.source || "?";
+}
+
 /* ===== Enforcement (issue 09) ===== */
 
 /** Proveniência mínima para mapear a extensão dona (ver `pi.getAllTools()`). */
@@ -176,7 +200,8 @@ export function toolOwnerName(info: ToolSourceInfo): string | null {
   if (info.source === "builtin" || info.source === "sdk") return null;
   if (info.origin === "package" && info.baseDir) return baseName(info.baseDir) || null;
   const stem = baseName(info.path).replace(/\.[^.]*$/, "");
-  if (!stem || (stem.startsWith("<") && stem.endsWith(">"))) return null;
+  // Paths sintéticos (<builtin:…>, <inline:…>) não são extensões.
+  if (!stem || stem.startsWith("<")) return null;
   if (stem === "index") return dirName(info.path) || null;
   return stem;
 }
@@ -253,10 +278,15 @@ export function planTools(opts: {
 }): ToolPlan {
   if (opts.profileTools === undefined) return { touched: false, finalTools: [], warnings: [] };
   const warnings: string[] = [];
+  const cli = opts.cli ?? {};
+  // --tools/--no-tools restringem o próprio load: o inventário vem incompleto
+  // (sonda: getAllTools() retorna só o CLI). Sem ele, impossível distinguir
+  // nome desconhecido de tool oculta pelo CLI — validação suprimida, CLI manda.
+  const inventoryComplete = cli.tools === undefined && !cli.noTools;
   const known = new Set(opts.tools.map((t) => t.name));
   const valid = opts.profileTools.filter((n) => known.has(n));
   const unknown = opts.profileTools.filter((n) => !known.has(n));
-  if (unknown.length > 0) warnings.push(`Warning: Unknown tools: ${unknown.join(", ")} (ignorado)`);
+  if (unknown.length > 0 && inventoryComplete) warnings.push(`Warning: Unknown tools: ${unknown.join(", ")} (ignorado)`);
 
   const byName = new Map(opts.tools.map((t) => [t.name, t]));
   let gated = valid;
@@ -273,7 +303,6 @@ export function planTools(opts: {
     }
   }
 
-  const cli = opts.cli ?? {};
   if (cli.noTools) {
     warnings.push("Warning: CLI --no-tools sobrepõe o profile (todas as tools desligadas).");
     return { touched: true, finalTools: [], warnings };
