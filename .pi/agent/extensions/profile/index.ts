@@ -23,11 +23,23 @@ import {
   isCompatiblePiVersion,
   isEmptyProfile,
   mergeProfiles,
+  nonBlockableExtensionsWarning,
+  normalizeSkillName,
+  parseCliToolFlags,
+  planField,
+  planTools,
+  filterSkillMentions,
   resolveProfile,
   selectStartup,
+  toolOwnerName,
+  unknownFieldWarning,
   unknownProfileError,
+  type CliToolFlags,
   type MergedProfiles,
   type Profile,
+  type ResolvedProfile,
+  type ToolInventoryEntry,
+  type ToolSourceInfo,
 } from "./config.js";
 
 /** Manter em sync com package.json. Exibido no seletor/list. */
@@ -42,6 +54,26 @@ const NONE_LABEL = "(none)";
 /** Leitura + UI (eventos e comandos). Reload só onde a troca exige (use/seletor). */
 type ProfileReadCtx = Pick<ExtensionContext, "cwd" | "hasUI" | "isProjectTrusted" | "sessionManager" | "ui">;
 type ProfileCmdCtx = ProfileReadCtx & { reload(): Promise<unknown> };
+
+/** Comando registrado por extensão (inventário de skills/prompts/comandos). */
+interface CommandInventoryEntry {
+  name: string;
+  source: string;
+  sourceInfo: ToolSourceInfo;
+}
+
+/** Gates ativos do profile em vigor (null = sem profile = Pi como hoje). */
+interface EnforcementState {
+  profileName: string;
+  toolsTouched: boolean;
+  finalTools: string[];
+  skillsTouched: boolean;
+  allowedSkills: string[];
+  inventorySkills: string[];
+  promptsTouched: boolean;
+  allowedPrompts: string[];
+  promptNames: string[];
+}
 
 interface SettingsSlice {
   profiles: Record<string, Profile>;
@@ -179,6 +211,8 @@ function readSessionChoice(ctx: ProfileReadCtx): { present: boolean; name: strin
 export default function profileExtension(pi: ExtensionAPI) {
   /** Nome ativo nesta instância (pós-reload, restaurado via `profile-state`). */
   let activeName: string | null = null;
+  /** Gates em vigor (issue 09). null = sem profile ativo = Pi como hoje. */
+  let enforcement: EnforcementState | null = null;
 
   pi.registerFlag("profile", {
     description: "Profile nomeado a ativar (profiles em settings.json)",
@@ -187,13 +221,101 @@ export default function profileExtension(pi: ExtensionAPI) {
 
   function setMarker(ctx: ProfileReadCtx, name: string | null): void {
     activeName = name;
+    if (name === null) enforcement = null;
     ctx.ui.setStatus(STATUS_ID, name ? `profile:${name}` : undefined);
   }
 
-  // Issue 09: aplicar allowlists aqui (setActiveTools + gates). Em 08, seleção
-  // pura: só registra o nome + marcador, sem tocar em tools/skills/prompts.
-  function applyEnforcement(_name: string): void {
-    // noop em 08
+  function collectTools(): ToolInventoryEntry[] {
+    return pi.getAllTools().map((t) => ({
+      name: t.name,
+      owner: toolOwnerName(t.sourceInfo as ToolSourceInfo),
+      builtin: (t.sourceInfo as { source: string }).source === "builtin",
+    }));
+  }
+
+  function collectCommands(): CommandInventoryEntry[] {
+    return pi.getCommands().map((c) => ({
+      name: c.name,
+      source: c.source,
+      sourceInfo: c.sourceInfo as ToolSourceInfo,
+    }));
+  }
+
+  /**
+   * Calcula gates + warnings de um profile resolvido (puro dados os inventários).
+   * Aplicar = `setActiveTools` + guardar `enforcement`; `show` só pré-visualiza.
+   */
+  function computeEnforcement(
+    profileName: string,
+    resolved: ResolvedProfile,
+    toolsInv: ToolInventoryEntry[],
+    commands: CommandInventoryEntry[],
+    cli: CliToolFlags,
+  ): { state: EnforcementState; warnings: string[] } {
+    const warnings: string[] = [];
+    const toolPlan = planTools({
+      profileTools: resolved.tools,
+      tools: toolsInv,
+      allowedExtensions: resolved.extensions,
+      cli,
+    });
+    warnings.push(...toolPlan.warnings);
+
+    const skillNames = commands.filter((c) => c.source === "skill").map((c) => normalizeSkillName(c.name));
+    const skillPlan = planField({ values: resolved.skills, inventory: skillNames, field: "skills" });
+    if (skillPlan.unknown.length > 0) warnings.push(unknownFieldWarning("skills", skillPlan.unknown));
+
+    const promptNames = commands.filter((c) => c.source === "prompt").map((c) => c.name);
+    const promptPlan = planField({ values: resolved.prompts, inventory: promptNames, field: "prompts" });
+    if (promptPlan.unknown.length > 0) warnings.push(unknownFieldWarning("prompts", promptPlan.unknown));
+
+    if (resolved.extensions !== undefined) {
+      const allow = new Set(resolved.extensions);
+      const selfOwners = new Set(
+        commands
+          .filter((c) => c.source === "extension" && c.name === "profile")
+          .map((c) => toolOwnerName(c.sourceInfo))
+          .filter((o): o is string => o !== null),
+      );
+      const nonBlockable = [
+        ...new Set(
+          commands
+            .filter((c) => c.source === "extension")
+            .map((c) => toolOwnerName(c.sourceInfo))
+            .filter((o): o is string => o !== null && !allow.has(o) && !selfOwners.has(o)),
+        ),
+      ].sort();
+      if (nonBlockable.length > 0) warnings.push(nonBlockableExtensionsWarning(nonBlockable));
+    }
+
+    return {
+      state: {
+        profileName,
+        toolsTouched: toolPlan.touched,
+        finalTools: toolPlan.finalTools,
+        skillsTouched: skillPlan.touched,
+        allowedSkills: skillPlan.allowed,
+        inventorySkills: [...new Set(skillNames)],
+        promptsTouched: promptPlan.touched,
+        allowedPrompts: promptPlan.allowed,
+        promptNames: [...new Set(promptNames)],
+      },
+      warnings,
+    };
+  }
+
+  /** Aplica os gates (issue 09): tools somem do prompt + backstops armados. */
+  function applyEnforcement(ctx: ProfileReadCtx, name: string, resolved: ResolvedProfile): void {
+    const { state, warnings } = computeEnforcement(
+      name,
+      resolved,
+      collectTools(),
+      collectCommands(),
+      parseCliToolFlags(process.argv),
+    );
+    enforcement = state;
+    if (state.toolsTouched) pi.setActiveTools(state.finalTools);
+    for (const w of warnings) ctx.ui.notify(w, "warning");
   }
 
   function checkCompat(ctx: ProfileReadCtx): void {
@@ -216,7 +338,7 @@ export default function profileExtension(pi: ExtensionAPI) {
     }
     if (isEmptyProfile(r.profile)) ctx.ui.notify(emptyProfileWarning(), "warning");
     setMarker(ctx, name);
-    applyEnforcement(name);
+    applyEnforcement(ctx, name, r.profile);
     if (originNote) ctx.ui.notify(`Profile "${name}" ativo (${originNote}).`, "info");
   }
 
@@ -254,6 +376,60 @@ export default function profileExtension(pi: ExtensionAPI) {
 
   pi.on("turn_start", async () => {
     if (activeName) pi.appendEntry(STATE_TYPE, { name: activeName });
+  });
+
+  // Backstop: tool fora do profile nunca executa (defesa em profundidade;
+  // setActiveTools já a escondeu do prompt). Sem profile/tools = inerte.
+  pi.on("tool_call", async (event) => {
+    const en = enforcement;
+    if (!en || !en.toolsTouched) return;
+    const toolName = (event as { toolName?: unknown }).toolName;
+    if (typeof toolName === "string" && !en.finalTools.includes(toolName)) {
+      return {
+        block: true,
+        reason: `Bloqueado pelo profile "${en.profileName}": tool "${toolName}" fora do profile.`,
+      };
+    }
+  });
+
+  // Skills/prompts fora do profile recusam no input, antes da expansão.
+  // Comandos de extensão passam antes (bypass) e builtins/desconhecidos não tocam.
+  pi.on("input", async (event, ctx) => {
+    const en = enforcement;
+    if (!en) return;
+    const e = event as { text?: unknown; source?: unknown };
+    if (e.source === "extension") return;
+    if (typeof e.text !== "string") return;
+    const m = e.text.trim().match(/^\/(\S+)/);
+    if (!m) return;
+    const invoked = m[1];
+    if (invoked === "skill:" || invoked.startsWith("skill:")) {
+      if (!en.skillsTouched) return;
+      const name = normalizeSkillName(invoked);
+      if (!name) return;
+      if (!en.inventorySkills.includes(name)) return; // desconhecida: o Pi trata
+      if (!en.allowedSkills.includes(name)) {
+        ctx.ui.notify(`Profile "${en.profileName}" bloqueou /skill:${name} (fora do profile).`, "warning");
+        return { action: "handled" };
+      }
+      return;
+    }
+    if (!en.promptsTouched) return;
+    if (!en.promptNames.includes(invoked)) return; // builtin, extensão ou desconhecido: não toca
+    if (!en.allowedPrompts.includes(invoked)) {
+      ctx.ui.notify(`Profile "${en.profileName}" bloqueou /${invoked} (fora do profile).`, "warning");
+      return { action: "handled" };
+    }
+  });
+
+  // Skills fora do profile somem do systemPrompt (blocos <skill> exatos).
+  pi.on("before_agent_start", async (event) => {
+    const en = enforcement;
+    if (!en || !en.skillsTouched) return;
+    const e = event as { systemPrompt?: unknown };
+    if (typeof e.systemPrompt !== "string") return;
+    const filtered = filterSkillMentions(e.systemPrompt, en.allowedSkills);
+    if (filtered !== e.systemPrompt) return { systemPrompt: filtered };
   });
 
   function formatProfileLine(name: string, loaded: LoadedConfig): string {
@@ -321,8 +497,46 @@ export default function profileExtension(pi: ExtensionAPI) {
     const lines = [`profile ${name} [${loaded.merged.origins[name]}] (resolvido, sem aplicar):`];
     lines.push(JSON.stringify(r.profile, null, 2));
     if (isEmptyProfile(r.profile)) lines.push(emptyProfileWarning());
+    // Preview do que a ativação faria/emitiria (issue 09), sem aplicar nada.
+    const toolsInv = collectTools();
+    const commands = collectCommands();
+    const { state, warnings } = computeEnforcement(name, r.profile, toolsInv, commands, parseCliToolFlags(process.argv));
+    if (r.profile.tools !== undefined) {
+      const byName = new Map(toolsInv.map((t) => [t.name, t]));
+      const ownerOf = (n: string): string => {
+        const t = byName.get(n);
+        if (!t) return "desconhecida";
+        if (t.owner === null) return t.builtin ? "builtin" : "sdk";
+        return `extensão ${t.owner}`;
+      };
+      const listed = r.profile.tools.length > 0 ? r.profile.tools.map((n) => `${n} (${ownerOf(n)})`).join(", ") : "(nenhuma — tudo desligado)";
+      lines.push(`tools: ${listed}`);
+      if (state.toolsTouched) lines.push(`tools efetivas: ${state.finalTools.join(", ") || "(nenhuma)"}`);
+    }
+    const extensionsNote = undetectedExtensionsNote(r.profile, toolsInv, commands);
+    if (extensionsNote !== null) lines.push(extensionsNote);
+    for (const w of warnings) lines.push(w);
     for (const w of loaded.warnings) lines.push(w);
     ctx.ui.notify(lines.join("\n"), "info");
+  }
+
+  /** Info (não warning): extensões listadas sem tools/comandos detectados — inventário parcial. */
+  function undetectedExtensionsNote(
+    resolved: ResolvedProfile,
+    toolsInv: ToolInventoryEntry[],
+    commands: CommandInventoryEntry[],
+  ): string | null {
+    if (resolved.extensions === undefined || resolved.extensions.length === 0) return null;
+    const seen = new Set<string>();
+    for (const t of toolsInv) if (t.owner !== null) seen.add(t.owner);
+    for (const c of commands) {
+      if (c.source !== "extension") continue;
+      const o = toolOwnerName(c.sourceInfo);
+      if (o !== null) seen.add(o);
+    }
+    const missing = resolved.extensions.filter((e) => !seen.has(e));
+    if (missing.length === 0) return null;
+    return `Nota: extensões no profile sem tools/comandos detectados: ${missing.join(", ")} (verifique o nome)`;
   }
 
   async function showSelector(ctx: ProfileCmdCtx, loaded: LoadedConfig): Promise<void> {
