@@ -1,6 +1,6 @@
 {
   "name": "pi-profile",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Profiles nomeados (tools/skills/prompts/extensions) via settings.json — camada opt-in",
   "type": "module",
   "pi": {

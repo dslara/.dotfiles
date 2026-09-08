@@ -16,11 +16,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-import { Box, Text } from "@earendil-works/pi-tui";
+import { CONFIG_DIR_NAME, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { Box, Container, SettingsList, Text, type SettingItem } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
   activationError,
+  applyBuilderChange,
+  builderInitial,
+  builderResult,
+  BUILDER_RESOURCES,
   emptyProfileWarning,
   formatVersionLine,
   isCompatiblePiVersion,
@@ -33,12 +37,17 @@ import {
   planTools,
   filterSkillMentions,
   inventoryOrigin,
+  isValidProfileName,
+  knownExtensionOwners,
   resolveProfile,
+  saveProfileToFile,
   selectStartup,
   toolOwnerName,
   unknownFieldWarning,
   unknownProfileError,
   type CliToolFlags,
+  type BuilderResource,
+  type BuilderState,
   type MergedProfiles,
   type Profile,
   type ResolvedProfile,
@@ -47,7 +56,7 @@ import {
 } from "./config.js";
 
 /** Manter em sync com package.json. Exibido no seletor/list. */
-const EXT_VERSION = "0.2.0";
+const EXT_VERSION = "0.3.0";
 /** Baseline de compat testada. Mismatch = warning, nunca trava o boot. */
 const PI_COMPAT = "0.85.0";
 
@@ -58,7 +67,7 @@ const NONE_LABEL = "(none)";
 const TOOL_NAME = "profile_use";
 
 /** Leitura + UI (eventos e comandos). Reload só onde a troca exige (use/seletor). */
-type ProfileReadCtx = Pick<ExtensionContext, "cwd" | "hasUI" | "isProjectTrusted" | "sessionManager" | "ui">;
+type ProfileReadCtx = Pick<ExtensionContext, "cwd" | "hasUI" | "isProjectTrusted" | "mode" | "sessionManager" | "ui">;
 type ProfileCmdCtx = ProfileReadCtx & { reload(): Promise<unknown> };
 
 /** Comando registrado por extensão (inventário de skills/prompts/comandos). */
@@ -582,13 +591,7 @@ export default function profileExtension(pi: ExtensionAPI) {
     commands: CommandInventoryEntry[],
   ): string | null {
     if (resolved.extensions === undefined || resolved.extensions.length === 0) return null;
-    const seen = new Set<string>();
-    for (const t of toolsInv) if (t.owner !== null) seen.add(t.owner);
-    for (const c of commands) {
-      if (c.source !== "extension") continue;
-      const o = toolOwnerName(c.sourceInfo);
-      if (o !== null) seen.add(o);
-    }
+    const seen = new Set(knownExtensionOwners(toolsInv, commands));
     const missing = resolved.extensions.filter((e) => !seen.has(e));
     if (missing.length === 0) return null;
     return `Nota: extensões no profile sem tools/comandos detectados: ${missing.join(", ")} (verifique o nome)`;
@@ -615,6 +618,153 @@ export default function profileExtension(pi: ExtensionAPI) {
     }
     const name = labelByName.get(picked);
     if (name) await useProfile(ctx, name);
+  }
+
+  /** Builder interativo (issue 11): toggles sobre o inventário real + modo por recurso. */
+  async function openBuilder(
+    ctx: ProfileCmdCtx,
+    loaded: LoadedConfig,
+    opts: { name: string; stored: Profile | undefined; origin: "global" | "projeto"; lockTarget: boolean },
+  ): Promise<void> {
+    if (!ctx.hasUI || ctx.mode !== "tui") {
+      ctx.ui.notify("Builder de profile requer TUI — edite profiles:{} em settings.json (veja /profile inventory).", "error");
+      return;
+    }
+    const toolsInv = collectTools();
+    const commands = collectCommands();
+    const toolDescs = new Map(pi.getAllTools().map((t) => [t.name, t.description]));
+    const cmdDescs = new Map(pi.getCommands().map((c) => [c.name, c.description]));
+    const short = (d: string | undefined): string => {
+      if (!d) return "";
+      const one = d.replace(/\s+/g, " ").trim();
+      return one.length > 60 ? `${one.slice(0, 57)}…` : ` — ${one}`;
+    };
+    const inventory: Record<BuilderResource, string[]> = {
+      tools: toolsInv.map((t) => t.name),
+      skills: commands.filter((c) => c.source === "skill").map((c) => normalizeSkillName(c.name)),
+      prompts: commands.filter((c) => c.source === "prompt").map((c) => c.name),
+      extensions: knownExtensionOwners(toolsInv, commands),
+    };
+    const describe = (res: BuilderResource, key: string): string => {
+      if (res === "tools") return toolDescs.get(key) ?? "";
+      if (res === "extensions") return "";
+      const full = res === "skills" ? `skill:${key}` : key;
+      return cmdDescs.get(full) ?? cmdDescs.get(key) ?? "";
+    };
+    const state = builderInitial(opts.name, opts.stored, inventory, opts.origin);
+    const targetPath = (t: "global" | "projeto"): string =>
+      t === "projeto" ? join(ctx.cwd, CONFIG_DIR_NAME, "settings.json") : join(getAgentDir(), "settings.json");
+
+    const buildItems = (): SettingItem[] => {
+      const items: SettingItem[] = [];
+      if (!opts.lockTarget && loaded.trusted) {
+        items.push({ id: "__target", label: "salvar em", currentValue: state.target, values: ["global", "projeto"] });
+      }
+      for (const res of BUILDER_RESOURCES) {
+        items.push({ id: `mode:${res}`, label: `${res} — modo`, currentValue: state.modes[res], values: ["seguir", "personalizar", "desligar"] });
+        for (const item of state.items[res]) {
+          items.push({
+            id: `item:${res}:${item.key}`,
+            label: `  ${item.key}${item.known ? "" : " (desconhecido)"}${short(describe(res, item.key))}`,
+            currentValue: item.checked ? "on" : "off",
+            values: ["on", "off"],
+          });
+        }
+      }
+      return items;
+    };
+
+    await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+      const container = new Container();
+      const header = new Text(
+        theme.fg(
+          "accent",
+          theme.bold(
+            `Profile: ${opts.name}  (escreve em ${opts.lockTarget ? opts.origin : state.target})\nseguir=não toca · personalizar=só marcados · desligar=[] · Esc fecha`,
+          ),
+        ),
+      );
+      container.addChild(header);
+      const items = buildItems();
+      const list = new SettingsList(items, Math.min(items.length + 2, 20), getSettingsListTheme(), (id, value) => {
+        applyBuilderChange(state, id, value);
+      }, () => done(undefined));
+      container.addChild(list);
+      return {
+        render(width: number) {
+          return container.render(width);
+        },
+        invalidate() {
+          container.invalidate();
+        },
+        handleInput(data: string) {
+          list.handleInput?.(data);
+          tui.requestRender();
+        },
+      };
+    });
+
+    const result = builderResult(state);
+    const where = state.target;
+    const save = await ctx.ui.confirm(`Salvar profile "${opts.name}"`, `Escrever em ${targetPath(where)}?`);
+    if (!save) {
+      ctx.ui.notify("Edição descartada — nada foi escrito.", "info");
+      return;
+    }
+    const r = saveProfileToFile(targetPath(where), opts.name, result);
+    if (!r.ok) {
+      ctx.ui.notify(r.error, "error");
+      return;
+    }
+    ctx.ui.notify(`Profile "${opts.name}" salvo em ${where}.`, "info");
+    const activate = await ctx.ui.confirm(`Ativar "${opts.name}" agora?`, "Aplica com reload in-place (conversa preservada).");
+    if (activate) await useProfile(ctx, opts.name);
+  }
+
+  async function newProfile(ctx: ProfileCmdCtx, loaded: LoadedConfig, argName: string): Promise<void> {
+    let name = argName;
+    if (!name) {
+      const input = await ctx.ui.input("Novo profile", "ex: webdev");
+      if (!input) return;
+      name = input.trim().split(/\s+/)[0] ?? "";
+    }
+    const bad = isValidProfileName(name);
+    if (bad) {
+      ctx.ui.notify(bad, "error");
+      return;
+    }
+    const exists = loaded.merged.map[name] !== undefined;
+    if (exists) {
+      const over = await ctx.ui.confirm(`Profile "${name}" já existe`, `Sobrescrever [${loaded.merged.origins[name]}]? (use /profile edit para ajustar)`);
+      if (!over) return;
+    }
+    const stored = exists ? loaded.merged.map[name] : undefined;
+    const origin = exists ? loaded.merged.origins[name] : "global";
+    await openBuilder(ctx, loaded, { name, stored, origin, lockTarget: false });
+  }
+
+  async function editProfile(ctx: ProfileCmdCtx, loaded: LoadedConfig, argName: string): Promise<void> {
+    let name = argName;
+    if (!name) {
+      const names = Object.keys(loaded.merged.map).sort();
+      if (names.length === 0) {
+        ctx.ui.notify("Nenhum profile definido — use /profile new.", "error");
+        return;
+      }
+      if (!ctx.hasUI) {
+        ctx.ui.notify("Informe o nome: /profile edit <nome>.", "error");
+        return;
+      }
+      const picked = await ctx.ui.select("Edit profile", names);
+      if (!picked) return;
+      name = picked;
+    }
+    const stored = loaded.merged.map[name];
+    if (!stored) {
+      ctx.ui.notify(unknownProfileError(name, Object.keys(loaded.merged.map).sort()), "error");
+      return;
+    }
+    await openBuilder(ctx, loaded, { name, stored, origin: loaded.merged.origins[name], lockTarget: true });
   }
 
   /** Completions não têm ctx: lê só o global (sugestão; o merge real acontece no handler). */
@@ -690,18 +840,18 @@ export default function profileExtension(pi: ExtensionAPI) {
   }
 
   pi.registerCommand("profile", {
-    description: "Selecionar profile nomeado (list/show/use/inventory)",
+    description: "Profiles nomeados (list/show/use/new/edit/inventory)",
     getArgumentCompletions: (prefix: string) => {
       const space = prefix.indexOf(" ");
       if (space === -1) {
-        const out = ["list", "show", "use", "inventory", ...globalNamesForCompletion()]
+        const out = ["list", "show", "use", "new", "edit", "inventory", ...globalNamesForCompletion()]
           .filter((v) => v.startsWith(prefix))
           .map((v) => ({ value: v, label: v }));
         return out.length > 0 ? out : null;
       }
       const first = prefix.slice(0, space);
       const rest = prefix.slice(space + 1);
-      if (first === "show" || first === "use") {
+      if (first === "show" || first === "use" || first === "edit") {
         const names = globalNamesForCompletion().filter((n) => n.startsWith(rest));
         return names.length > 0 ? names.map((v) => ({ value: `${first} ${v}`, label: v })) : null;
       }
@@ -744,6 +894,17 @@ export default function profileExtension(pi: ExtensionAPI) {
         await useProfile(ctxp, name === NONE_LABEL ? null : name);
         return;
       }
+      if (sub === "new" || sub === "edit") {
+        // Builder é TUI-only (custom UI): falha rápido fora do TUI, antes de
+        // qualquer diálogo (em RPC/print os dialogs bloqueariam sem resposta).
+        if (!ctxp.hasUI || ctxp.mode !== "tui") {
+          ctx.ui.notify("Builder de profile requer TUI — edite profiles:{} em settings.json (veja /profile inventory).", "error");
+          return;
+        }
+        if (sub === "new") await newProfile(ctxp, loaded, target.split(/\s+/)[0] ?? "");
+        else await editProfile(ctxp, loaded, target.split(/\s+/)[0] ?? "");
+        return;
+      }
       // Atalho: `/profile <nome>` = use; `(none)` = limpar.
       if (!target && loaded.merged.map[sub]) {
         await useProfile(ctxp, sub);
@@ -754,7 +915,7 @@ export default function profileExtension(pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(
-        `Uso: /profile · /profile list · /profile show <nome> · /profile use <nome|${NONE_LABEL}> · /profile inventory [recurso]`,
+        `Uso: /profile · /profile list · /profile show <nome> · /profile use <nome|${NONE_LABEL}> · /profile new [nome] · /profile edit [nome] · /profile inventory [recurso]`,
         "error",
       );
     },

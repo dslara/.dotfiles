@@ -1,6 +1,9 @@
-// Lógica pura de profiles (issues 08+09). Sem imports do Pi: testável com node direto.
+// Lógica pura de profiles (issues 08+09+11). Só builtins do node: testável com node direto.
 // Decisões-fonte: issues/02-config-merge-trust.md, issues/03-profile-semantics.md,
 // issues/04-tools-addressing.md. Formatos validados contra runtime via sonda -e.
+
+import { dirname } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 /** Shape do profile v1 (spec §3.1). Todos os campos opcionais. */
 export interface Profile {
@@ -152,6 +155,164 @@ export interface InventoryProvenance {
   path: string;
   scope?: string;
   origin?: string;
+}
+
+/* ===== Builder TUI (issue 11) ===== */
+
+export type BuilderResource = "tools" | "skills" | "prompts" | "extensions";
+export const BUILDER_RESOURCES: BuilderResource[] = ["tools", "skills", "prompts", "extensions"];
+
+/** seguir = campo omitido; personalizar = allowlist dos checados; desligar = []. */
+export type ResourceMode = "seguir" | "personalizar" | "desligar";
+
+export interface BuilderItem {
+  key: string;
+  checked: boolean;
+  known: boolean;
+}
+
+export interface BuilderState {
+  name: string;
+  description: string;
+  extends?: string;
+  target: "global" | "projeto";
+  modes: Record<BuilderResource, ResourceMode>;
+  items: Record<BuilderResource, BuilderItem[]>;
+}
+
+export function isValidProfileName(name: string): string | null {
+  if (!name) return 'Nome vazio — informe um nome (ex: "webdev").';
+  if (/\s/.test(name)) return "Nome com espaço — use um token único (ex: webdev-strict).";
+  if (name === "(none)") return 'Nome reservado — "(none)" limpa o profile, não pode ser um profile.';
+  return null;
+}
+
+/** Donos de extensão detectáveis (tools + comandos; fora sintéticos). Para o builder e o show. */
+export function knownExtensionOwners(
+  tools: Array<{ owner: string | null }>,
+  commands: Array<{ source: string; sourceInfo: ToolSourceInfo }>,
+): string[] {
+  const seen = new Set<string>();
+  for (const t of tools) if (t.owner !== null) seen.add(t.owner);
+  for (const c of commands) {
+    if (c.source !== "extension") continue;
+    const o = toolOwnerName(c.sourceInfo);
+    if (o !== null) seen.add(o);
+  }
+  return [...seen].sort();
+}
+
+function modeOf(values: string[] | undefined): ResourceMode {
+  if (values === undefined) return "seguir";
+  if (values.length === 0) return "desligar";
+  return "personalizar";
+}
+
+/**
+ * Estado inicial do builder: novo (tudo seguir) ou edição do armazenado
+ * (reflete omitido/[]/lista; desconhecidos entram checados para não perder dado).
+ */
+export function builderInitial(
+  name: string,
+  stored: Profile | undefined,
+  inventory: Record<BuilderResource, string[]>,
+  target: "global" | "projeto",
+): BuilderState {
+  const modes = {} as Record<BuilderResource, ResourceMode>;
+  const items = {} as Record<BuilderResource, BuilderItem[]>;
+  for (const res of BUILDER_RESOURCES) {
+    const values = stored?.[res];
+    modes[res] = modeOf(values);
+    const norm = res === "skills" ? normalizeSkillName : (s: string) => s;
+    const known = new Set((inventory[res] ?? []).map(norm));
+    const listed = (values ?? []).map(norm);
+    const rows: BuilderItem[] = (inventory[res] ?? []).map((raw) => ({
+      key: norm(raw),
+      checked: values === undefined ? true : listed.includes(norm(raw)),
+      known: true,
+    }));
+    for (const v of listed) {
+      if (!known.has(v)) rows.push({ key: v, checked: true, known: false });
+    }
+    items[res] = rows;
+  }
+  return { name, description: stored?.description ?? "", extends: stored?.extends, target, modes, items };
+}
+
+/** Aplica uma mudança da lista (id `mode:<res>` | `item:<res>:<key>` | `__target`). */
+export function applyBuilderChange(state: BuilderState, id: string, value: string): void {
+  if (id === "__target") {
+    if (value === "global" || value === "projeto") state.target = value;
+    return;
+  }
+  if (id.startsWith("mode:")) {
+    const res = id.slice("mode:".length) as BuilderResource;
+    if (BUILDER_RESOURCES.includes(res) && (value === "seguir" || value === "personalizar" || value === "desligar")) {
+      state.modes[res] = value;
+    }
+    return;
+  }
+  if (id.startsWith("item:")) {
+    const rest = id.slice("item:".length);
+    const sep = rest.indexOf(":");
+    if (sep === -1) return;
+    const res = rest.slice(0, sep) as BuilderResource;
+    const key = rest.slice(sep + 1);
+    const item = BUILDER_RESOURCES.includes(res) ? state.items[res].find((i) => i.key === key) : undefined;
+    if (item && (value === "on" || value === "off")) item.checked = value === "on";
+  }
+}
+
+/** Estado → Profile (seguir omite; desligar zera; personalizar = checados, com desconhecidos). */
+export function builderResult(state: BuilderState): Profile {
+  const out: Profile = {};
+  if (state.description) out.description = state.description;
+  if (state.extends) out.extends = state.extends;
+  for (const res of BUILDER_RESOURCES) {
+    const mode = state.modes[res];
+    if (mode === "seguir") continue;
+    if (mode === "desligar") {
+      out[res] = [];
+      continue;
+    }
+    out[res] = state.items[res].filter((i) => i.checked).map((i) => i.key);
+  }
+  return out;
+}
+
+export type SaveResult = { ok: true } | { ok: false; error: string };
+
+/**
+ * Escrita read-modify-write de um profile no settings (cria arquivo se ausente).
+ * JSON inválido ou erro de IO = erro sem clobber.
+ */
+export function saveProfileToFile(filePath: string, name: string, profile: Profile): SaveResult {
+  let disk: Record<string, unknown> = {};
+  if (existsSync(filePath)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(filePath, "utf-8"));
+    } catch {
+      return { ok: false, error: `JSON inválido em ${filePath} — edite manualmente.` };
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { ok: false, error: `${filePath} não é um objeto — edite manualmente.` };
+    }
+    disk = parsed as Record<string, unknown>;
+  }
+  const profiles =
+    typeof disk.profiles === "object" && disk.profiles !== null && !Array.isArray(disk.profiles)
+      ? (disk.profiles as Record<string, unknown>)
+      : {};
+  profiles[name] = JSON.parse(JSON.stringify(profile)) as unknown;
+  disk.profiles = profiles;
+  try {
+    mkdirSync(dirname(filePath), { recursive: true });
+    writeFileSync(filePath, `${JSON.stringify(disk, null, 2)}\n`, "utf-8");
+  } catch (err) {
+    return { ok: false, error: `Falha ao escrever ${filePath}: ${err}.` };
+  }
+  return { ok: true };
 }
 
 /**

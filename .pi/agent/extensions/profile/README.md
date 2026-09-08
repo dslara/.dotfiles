@@ -48,7 +48,8 @@ Shape (`Profile`): `description?`, `extends?` (um pai), `tools?`, `skills?`,
 `prompts?`, `extensions?` — todos opcionais, nomes exatos do inventário
 (veja `/profile inventory` para copiar; case-sensitive, sem globs).
 
-Semântica por campo:
+Semântica por campo (o builder em `personalizar` com tudo marcado gera lista
+  explícita — diferente de omitir; `extends` só via JSON):
 
 - **Omitido = não toca** (herda o Pi atual). **`[]` = desliga o recurso.**
   **`{}` = no-op + warning.**
@@ -76,6 +77,11 @@ Exemplos:
   a ativação emitiria; nunca aplica nada
 - `/profile use <nome| (none)>` — valida → aplica → reload in-place
   (mesma sessão/arquivo, conversa 100% preservada)
+- `/profile new [nome]` — builder interativo: toggles do inventário por recurso
+  (`seguir` = omite · `personalizar` = só marcados · `desligar` = `[]`),
+  salva no global ou no projeto (trusted) e oferece ativar na hora
+- `/profile edit [nome]` — mesmo builder sobre o perfil armazenado (escopo de
+  origem); `extends` e nomes desconhecidos são preservados
 - `/profile inventory [tools|skills|prompts|extensions]` — tudo disponível para
   montar o profile: nome invocável real, descrição, origem, habilitado-no-ativo
 - `--profile <nome>` — flag CLI, vence defaults; inexistente = warning + fallback

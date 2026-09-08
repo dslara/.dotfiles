@@ -71,3 +71,15 @@ Todos = fallback sem-profile (Pi como hoje) + mensagem; nada trava o boot.
 - `skills: []` desliga; campo omitido não toca. `SKILL.md` segue legível via
   `read` — o bloqueio é de comando+prompt, não de arquivo.
 - Colisão de comando vira `:1`/`:2` — enderece o nome real do inventário.
+
+## Builder (`/profile new|edit`)
+
+- Requer TUI (`custom` UI não existe em print/RPC/não-interativo) — fora dela,
+  monte via JSON com `/profile inventory` + `show` para validar.
+- `personalizar` com tudo marcado gera **lista explícita**, que congela o
+  profile contra mudanças futuras do Pi; `seguir` (omitido) acompanha.
+  Para "tudo como hoje", prefira `seguir`.
+- O builder não edita `extends` (preserva o existente; novo sai sem) — herança
+  vai no JSON. Nomes fora do inventário aparecem como `(desconhecido)` e são
+  preservados ao salvar.
+- Salvar no projeto exige projeto trusted; global sempre pode.
