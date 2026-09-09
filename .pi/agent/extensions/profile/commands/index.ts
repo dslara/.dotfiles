@@ -1,13 +1,17 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createProfileCommand } from "./create-profile.js";
+import { disableProfileCommand } from "./disable-profile.js";
 import { listProfilesCommand } from "./list-profiles.js";
 import { showProfileCommand } from "./show-profile.js";
+import { useProfileCommand } from "./use-profile.js";
 
 type ProfileCommandEntrypoint = (args: string[], ctx: ExtensionCommandContext) => Promise<void>;
 
 const profileCommandEntrypoints: Record<string, ProfileCommandEntrypoint> = {
   list: listProfilesCommand,
   create: createProfileCommand,
+  use: useProfileCommand,
+  off: disableProfileCommand,
   show: showProfileCommand,
 };
 
