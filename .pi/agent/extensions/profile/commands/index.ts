@@ -1,5 +1,6 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createProfileCommand } from "./create-profile.js";
+import { deleteProfileCommand } from "./delete-profile.js";
 import { disableProfileCommand } from "./disable-profile.js";
 import { listProfilesCommand } from "./list-profiles.js";
 import { showProfileCommand } from "./show-profile.js";
@@ -12,6 +13,7 @@ const profileCommandEntrypoints: Record<string, ProfileCommandEntrypoint> = {
   create: createProfileCommand,
   use: useProfileCommand,
   off: disableProfileCommand,
+  delete: deleteProfileCommand,
   show: showProfileCommand,
 };
 
