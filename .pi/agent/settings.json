@@ -4,7 +4,8 @@
     "npm:pi-extension-manager",
     "npm:@danchamorro/pi-prompt-enhancer",
     "npm:pi-model-picker",
-    "npm:pi-web-access"
+    "npm:pi-web-access",
+    "npm:pi-memory"
   ],
   "defaultProvider": "opencode-go",
   "defaultModel": "muse-spark-1.3-contributor",
