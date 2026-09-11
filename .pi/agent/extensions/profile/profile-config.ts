@@ -29,8 +29,12 @@ export function getStatePath(): string {
   return join(managerDir, STATE_FILE);
 }
 
+export function isValidProfileName(name: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name);
+}
+
 export function validateProfileName(name: string): void {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(name)) {
+  if (!isValidProfileName(name)) {
     throw new Error("Profile names may contain only letters, numbers, hyphens, and underscores.");
   }
 }

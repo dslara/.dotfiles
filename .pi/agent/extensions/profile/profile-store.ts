@@ -5,6 +5,7 @@ import {
   getProfileSettingsPath,
   getProfilesDir,
   getStatePath,
+  isValidProfileName,
   validateProfileName,
 } from "./profile-config.js";
 import { parseProfileSettings } from "./profile-schema.js";
@@ -68,7 +69,7 @@ export async function listProfileNames(): Promise<string[]> {
   if (!(await pathExists(getProfilesDir()))) return [];
   const profiles: string[] = [];
   for (const entry of await readdir(getProfilesDir(), { withFileTypes: true })) {
-    if (!entry.isDirectory() || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(entry.name)) continue;
+    if (!entry.isDirectory() || !isValidProfileName(entry.name)) continue;
     profiles.push(entry.name);
   }
   return profiles.sort((left, right) => left.localeCompare(right));

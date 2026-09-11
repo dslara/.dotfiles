@@ -14,17 +14,17 @@ A fresh profile starts truly empty: one blank settings file. Pi grows the resour
 
 Bare `/profile` lists, same as `/profile list`.
 
-- `/profile list` — all profiles, active one marked.
-- `/profile create <name>` — new empty profile. Names take letters, digits, hyphen, underscore, starting with a letter or digit. Duplicates fail. A failed create leaves no directory behind.
-- `/profile use <name>` — select and quit. Next launch runs inside.
-- `/profile off` — clear the selection and quit back to base.
-- `/profile show [name]` — print the profile settings file. No name means the active profile.
-- `/profile delete <name>` — remove the directory with everything in it. Refuses the active profile, asks first, proceeds without asking where no UI exists.
+- `/profile list`. All profiles, active one marked.
+- `/profile create <name>`. New empty profile. Names take letters, digits, hyphen, underscore, starting with a letter or digit. Duplicates fail. A failed create leaves no directory behind.
+- `/profile use <name>`. Select and quit. Next launch runs inside.
+- `/profile off`. Clear the selection and quit back to base.
+- `/profile show [name]`. Print the profile settings file. No name means the active profile.
+- `/profile delete <name>`. Remove the directory with everything in it. Refuses the active profile, asks first, proceeds without asking where no UI exists.
 
 Two flags cover single launches without touching the selection:
 
-- `pi --profile <name>` — this launch only.
-- `pi --no-profile` — base for this launch only, even with a selection set.
+- `pi --profile <name>`. This launch only.
+- `pi --no-profile`. Base for this launch only, even with a selection set.
 
 ## Sharing
 
@@ -38,12 +38,12 @@ Recopy this directory over the old one. No install step, no dependencies. Versio
 
 ## Troubleshooting
 
-- `Profile routing skipped: ...` on stderr — the selection points at a missing or invalid profile. Pi continues in base. Fix or clear the selection.
-- `No active profile.` — `show` with no name and nothing selected. Pass a name or select first.
-- `Deactivate the profile before deleting it.` — step out with `use` or `off` before deleting.
-- `Profile names may contain only letters, numbers, hyphens, and underscores.` — rename and retry.
-- `Invalid profile settings from ...` — the file failed validation. Fix the JSON or the packages shape and rewrite it.
-- `Unknown ...` style usage lines — run the bare command to see the six.
+- `Profile routing skipped: ...` on stderr. The selection points at a missing or invalid profile. Pi continues in base. Fix or clear the selection.
+- `No active profile.`. `show` with no name and nothing selected. Pass a name or select first.
+- `Deactivate the profile before deleting it.`. Step out with `use` or `off` before deleting.
+- `Profile names may contain only letters, numbers, hyphens, and underscores.`. Rename and retry.
+- `Invalid profile settings from ...`. The file failed validation. Fix the JSON or the packages shape and rewrite it.
+- `Unknown ...` style usage lines. Run the bare command to see the six.
 
 ## Manual checklist
 
@@ -65,5 +65,6 @@ Run top to bottom against the installed copy. UI steps need a real terminal.
 14. Delete refuses the active profile before asking.
 15. Delete headless proceeds.
 16. Fresh profile grows resource dirs on first run.
+17. Invalid settings write fails with the source named, next launch still boots.
 
 Old filter keys like `profiles` left in settings are ignored silently. Remove them by hand whenever.
